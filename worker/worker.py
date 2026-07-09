@@ -4,9 +4,9 @@ import random
 import time
 
 from database import SessionLocal, Base, engine
+from job_queue import dequeue_job
 from models import Job, JobStatus
 
-POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
 MIN_WORK_SECONDS = float(os.environ.get("MIN_WORK_SECONDS", "1"))
 MAX_WORK_SECONDS = float(os.environ.get("MAX_WORK_SECONDS", "4"))
 FAILURE_RATE = float(os.environ.get("FAILURE_RATE", "0.2"))
@@ -15,11 +15,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s worker %(message)s")
 log = logging.getLogger("worker")
 
 
-def fetch_next_job(db):
+def claim_job(db, job_id):
     job = (
         db.query(Job)
-        .filter(Job.status == JobStatus.pending)
-        .order_by(Job.created_at)
+        .filter(Job.id == job_id, Job.status == JobStatus.pending)
         .with_for_update(skip_locked=True)
         .first()
     )
@@ -55,15 +54,18 @@ def process_job(db, job):
 
 def main():
     Base.metadata.create_all(bind=engine)
-    log.info("worker starting, polling every %ss", POLL_INTERVAL_SECONDS)
+    log.info("worker starting, waiting for jobs on the queue")
     while True:
+        job_id = dequeue_job()
+        if not job_id:
+            continue
         db = SessionLocal()
         try:
-            job = fetch_next_job(db)
+            job = claim_job(db, job_id)
             if job:
                 process_job(db, job)
             else:
-                time.sleep(POLL_INTERVAL_SECONDS)
+                log.warning("job %s not found or already claimed", job_id)
         finally:
             db.close()
 

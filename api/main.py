@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 import models
 import schemas
 from database import engine, get_db
+from job_queue import enqueue_job
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -16,6 +17,7 @@ def create_job(body: schemas.JobCreate, db: Session = Depends(get_db)):
     db.add(job)
     db.commit()
     db.refresh(job)
+    enqueue_job(job.id)
     return job
 
 
