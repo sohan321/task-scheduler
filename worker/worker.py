@@ -3,10 +3,14 @@ import os
 import random
 import threading
 import time
+from datetime import datetime, timedelta
+
+from sqlalchemy import text
 
 from database import SessionLocal, Base, engine
 from job_queue import (
     dequeue_job,
+    has_lease,
     mark_inflight,
     clear_inflight,
     pop_expired_leases,
@@ -24,9 +28,20 @@ BASE_BACKOFF_SECONDS = float(os.environ.get("BASE_BACKOFF_SECONDS", "2"))
 MAX_BACKOFF_SECONDS = float(os.environ.get("MAX_BACKOFF_SECONDS", "60"))
 LEASE_SECONDS = float(os.environ.get("LEASE_SECONDS", "30"))
 SCHEDULER_INTERVAL_SECONDS = float(os.environ.get("SCHEDULER_INTERVAL_SECONDS", "1"))
+PENDING_ORPHAN_GRACE_SECONDS = float(
+    os.environ.get("PENDING_ORPHAN_GRACE_SECONDS", str(MAX_BACKOFF_SECONDS + 60))
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s worker %(message)s")
 log = logging.getLogger("worker")
+
+
+def run_schema_migrations(engine):
+    # create_all() only creates missing tables/types; on a database whose
+    # jobstatus enum already existed pre-Phase-3, it never adds new labels.
+    with engine.connect() as conn:
+        conn.execute(text("ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'dead_letter'"))
+        conn.commit()
 
 
 def claim_job(db, job_id):
@@ -72,7 +87,10 @@ def dead_letter(db, job, error):
     log.error("job %s dead-lettered after %s attempts: %s", job.id, job.attempts, error)
 
 
-def retry(db, job, error):
+def fail_attempt(db, job, error):
+    if job.attempts >= MAX_ATTEMPTS:
+        dead_letter(db, job, error)
+        return
     delay = backoff_delay(job.attempts)
     job.status = JobStatus.pending
     job.result = {"error": error}
@@ -84,56 +102,98 @@ def retry(db, job, error):
     )
 
 
+def _heartbeat_loop(job_id, attempt, stop_event):
+    interval = max(LEASE_SECONDS / 3, 1)
+    while not stop_event.wait(interval):
+        mark_inflight(job_id, attempt, LEASE_SECONDS)
+
+
 def process_job(db, job):
     log.info("processing job %s (attempt %s)", job.id, job.attempts)
-    mark_inflight(str(job.id), LEASE_SECONDS)
+    stop_heartbeat = threading.Event()
+    heartbeat = threading.Thread(
+        target=_heartbeat_loop, args=(str(job.id), job.attempts, stop_heartbeat), daemon=True
+    )
+    heartbeat.start()
     try:
+        mark_inflight(str(job.id), job.attempts, LEASE_SECONDS)
         result = simulate_work()
         job.status = JobStatus.success
         job.result = result
         db.commit()
         log.info("job %s succeeded", job.id)
     except Exception as exc:
-        if job.attempts >= MAX_ATTEMPTS:
-            dead_letter(db, job, str(exc))
-        else:
-            retry(db, job, str(exc))
+        fail_attempt(db, job, str(exc))
     finally:
-        clear_inflight(str(job.id))
+        stop_heartbeat.set()
+        heartbeat.join(timeout=1)
+        clear_inflight(str(job.id), job.attempts)
 
 
 def reap_expired_leases(db):
-    for job_id in pop_expired_leases():
+    for job_id, attempt in pop_expired_leases():
         job = (
             db.query(Job)
-            .filter(Job.id == job_id, Job.status == JobStatus.running)
+            .filter(Job.id == job_id, Job.status == JobStatus.running, Job.attempts == attempt)
             .with_for_update(skip_locked=True)
             .first()
         )
         if not job:
+            # already finished, or superseded by a newer attempt
             continue
         log.warning("job %s lease expired (attempt %s)", job.id, job.attempts)
-        if job.attempts >= MAX_ATTEMPTS:
-            dead_letter(db, job, "lease expired: worker crashed or exceeded visibility timeout")
-        else:
-            job.status = JobStatus.pending
-            db.commit()
-            requeue(str(job.id))
+        fail_attempt(db, job, "lease expired: worker crashed or exceeded visibility timeout")
+
+
+def sweep_stale_jobs(db):
+    # Backstop for the window between a Postgres commit and the matching Redis
+    # write (claim -> mark_inflight, retry/reap -> schedule_retry/requeue): if
+    # that write never lands (crash, transient Redis error), the row is stuck
+    # with no Redis entry and no other mechanism will ever revisit it.
+    running_cutoff = datetime.utcnow() - timedelta(seconds=LEASE_SECONDS)
+    stale_running = (
+        db.query(Job)
+        .filter(Job.status == JobStatus.running, Job.updated_at < running_cutoff)
+        .with_for_update(skip_locked=True)
+        .all()
+    )
+    for job in stale_running:
+        if has_lease(str(job.id), job.attempts):
+            # under normal lease management: fresh, heartbeat-renewed, or
+            # about to be picked up by reap_expired_leases
+            continue
+        log.warning("job %s running with no lease entry, reclaiming (orphan sweep)", job.id)
+        fail_attempt(db, job, "running with no active lease (orphan sweep)")
+
+    pending_cutoff = datetime.utcnow() - timedelta(seconds=PENDING_ORPHAN_GRACE_SECONDS)
+    stale_pending = (
+        db.query(Job)
+        .filter(Job.status == JobStatus.pending, Job.updated_at < pending_cutoff)
+        .all()
+    )
+    for job in stale_pending:
+        log.warning("job %s pending but stale, re-enqueueing (orphan sweep)", job.id)
+        requeue(str(job.id))
 
 
 def scheduler_loop():
     while True:
-        promote_due_retries()
-        db = SessionLocal()
         try:
-            reap_expired_leases(db)
-        finally:
-            db.close()
+            promote_due_retries()
+            db = SessionLocal()
+            try:
+                reap_expired_leases(db)
+                sweep_stale_jobs(db)
+            finally:
+                db.close()
+        except Exception:
+            log.exception("scheduler tick failed")
         time.sleep(SCHEDULER_INTERVAL_SECONDS)
 
 
 def main():
     Base.metadata.create_all(bind=engine)
+    run_schema_migrations(engine)
     log.info("worker starting, waiting for jobs on the queue")
     threading.Thread(target=scheduler_loop, daemon=True).start()
     while True:
@@ -147,6 +207,8 @@ def main():
                 process_job(db, job)
             else:
                 log.warning("job %s not found or already claimed", job_id)
+        except Exception:
+            log.exception("unhandled error processing job %s", job_id)
         finally:
             db.close()
 

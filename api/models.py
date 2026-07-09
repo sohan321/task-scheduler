@@ -12,7 +12,7 @@ class JobStatus(str, enum.Enum):
     pending = "pending"
     running = "running"
     success = "success"
-    failed = "failed"
+    failed = "failed"  # unreachable in current worker logic; kept for rows/consumers predating retry+dead-letter
     dead_letter = "dead_letter"
 
 

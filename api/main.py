@@ -1,4 +1,5 @@
 from fastapi import Depends, FastAPI, HTTPException
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import models
@@ -7,6 +8,12 @@ from database import engine, get_db
 from job_queue import enqueue_job
 
 models.Base.metadata.create_all(bind=engine)
+
+# create_all() only creates missing tables/types; on a database whose
+# jobstatus enum already existed pre-Phase-3, it never adds new labels.
+with engine.connect() as _conn:
+    _conn.execute(text("ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'dead_letter'"))
+    _conn.commit()
 
 app = FastAPI(title="Task Scheduler")
 

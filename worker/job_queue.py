@@ -25,16 +25,28 @@ def requeue(job_id):
     redis_client.rpush(READY_KEY, job_id)
 
 
-def mark_inflight(job_id, lease_seconds):
-    redis_client.zadd(INFLIGHT_KEY, {job_id: time.time() + lease_seconds})
+def _lease_member(job_id, attempt):
+    return f"{job_id}:{attempt}"
 
 
-def clear_inflight(job_id):
-    redis_client.zrem(INFLIGHT_KEY, job_id)
+def mark_inflight(job_id, attempt, lease_seconds):
+    redis_client.zadd(INFLIGHT_KEY, {_lease_member(job_id, attempt): time.time() + lease_seconds})
+
+
+def clear_inflight(job_id, attempt):
+    redis_client.zrem(INFLIGHT_KEY, _lease_member(job_id, attempt))
+
+
+def has_lease(job_id, attempt):
+    return redis_client.zscore(INFLIGHT_KEY, _lease_member(job_id, attempt)) is not None
 
 
 def pop_expired_leases():
-    return _pop_due(INFLIGHT_KEY)
+    leases = []
+    for member in _pop_due(INFLIGHT_KEY):
+        job_id, _, attempt = member.rpartition(":")
+        leases.append((job_id, int(attempt)))
+    return leases
 
 
 def schedule_retry(job_id, delay_seconds):
@@ -49,7 +61,7 @@ def promote_due_retries():
 def _pop_due(key):
     due = redis_client.zrangebyscore(key, 0, time.time())
     popped = []
-    for job_id in due:
-        if redis_client.zrem(key, job_id):
-            popped.append(job_id)
+    for member in due:
+        if redis_client.zrem(key, member):
+            popped.append(member)
     return popped
