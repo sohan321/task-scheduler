@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from models import JobStatus
+
 
 class JobCreate(BaseModel):
     payload: dict[str, Any]
@@ -12,7 +14,7 @@ class JobCreate(BaseModel):
 class JobResponse(BaseModel):
     id: UUID
     payload: dict[str, Any]
-    status: str
+    status: JobStatus
     attempts: int
     result: Optional[dict[str, Any]]
     created_at: datetime

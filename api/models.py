@@ -1,3 +1,5 @@
+# Kept in sync by hand with worker/models.py (separate Docker build contexts,
+# same Postgres schema) - a change here needs the identical edit there too.
 import enum
 import uuid
 from datetime import datetime

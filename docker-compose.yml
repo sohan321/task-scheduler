@@ -40,6 +40,9 @@ services:
       redis:
         condition: service_healthy
 
+  # Single replica by default. The worker holds no in-process concurrency -
+  # run multiple concurrent workers via `docker compose up --scale worker=N`;
+  # claim_job's Postgres row lock makes that safe against double-processing.
   worker:
     build: ./worker
     environment:

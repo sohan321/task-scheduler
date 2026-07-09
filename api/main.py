@@ -1,3 +1,5 @@
+import uuid
+
 from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -30,7 +32,11 @@ def create_job(body: schemas.JobCreate, db: Session = Depends(get_db)):
 
 @app.get("/jobs/{job_id}", response_model=schemas.JobResponse)
 def get_job(job_id: str, db: Session = Depends(get_db)):
-    job = db.query(models.Job).filter(models.Job.id == job_id).first()
+    try:
+        job_uuid = uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = db.query(models.Job).filter(models.Job.id == job_uuid).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job

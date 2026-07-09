@@ -45,6 +45,10 @@ def run_schema_migrations(engine):
 
 
 def claim_job(db, job_id):
+    # Load-bearing, not redundant with Redis: BLPOP only guarantees a given
+    # list *element* goes to one caller, not that a job_id *value* is never
+    # enqueued twice (enqueue_job does no dedup). This status=pending filter
+    # + row lock is what actually stops a second caller from reprocessing it.
     job = (
         db.query(Job)
         .filter(Job.id == job_id, Job.status == JobStatus.pending)

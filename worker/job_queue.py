@@ -5,6 +5,8 @@ import redis
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
+# READY_KEY must match api/job_queue.py's JOB_QUEUE_KEY exactly - it's the
+# same Redis list, enqueued by the API and consumed here.
 READY_KEY = "jobs:pending"
 INFLIGHT_KEY = "jobs:inflight"
 RETRY_KEY = "jobs:retry"
