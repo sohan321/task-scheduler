@@ -13,8 +13,10 @@ from job_queue import (
     has_lease,
     mark_inflight,
     clear_inflight,
+    migrate_legacy_ready_queue,
     pop_expired_leases,
     promote_due_retries,
+    promote_due_scheduled,
     requeue,
     schedule_retry,
 )
@@ -41,6 +43,8 @@ def run_schema_migrations(engine):
     # jobstatus enum already existed pre-Phase-3, it never adds new labels.
     with engine.connect() as conn:
         conn.execute(text("ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'dead_letter'"))
+        conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS run_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 0"))
         conn.commit()
 
 
@@ -99,7 +103,7 @@ def fail_attempt(db, job, error):
     job.status = JobStatus.pending
     job.result = {"error": error}
     db.commit()
-    schedule_retry(str(job.id), delay)
+    schedule_retry(str(job.id), job.priority, delay)
     log.warning(
         "job %s failed (attempt %s/%s), retrying in %.1fs: %s",
         job.id, job.attempts, MAX_ATTEMPTS, delay, error,
@@ -169,21 +173,34 @@ def sweep_stale_jobs(db):
         log.warning("job %s running with no lease entry, reclaiming (orphan sweep)", job.id)
         fail_attempt(db, job, "running with no active lease (orphan sweep)")
 
-    pending_cutoff = datetime.utcnow() - timedelta(seconds=PENDING_ORPHAN_GRACE_SECONDS)
+    now = datetime.utcnow()
+    pending_cutoff = now - timedelta(seconds=PENDING_ORPHAN_GRACE_SECONDS)
+    # A pending row is only an orphan candidate if it's BOTH stale (untouched
+    # past the grace period - the actual orphan signal) AND not intentionally
+    # waiting on a future run_at (updated_at never changes after creation, so
+    # a legitimately-delayed job would otherwise look "stale" long before
+    # it's due). These are two separate questions kept as one query for a
+    # single Postgres round-trip; don't conflate changes to one with the other.
+    is_stale = Job.updated_at < pending_cutoff
+    is_due_to_run = (Job.run_at.is_(None)) | (Job.run_at <= now)
     stale_pending = (
         db.query(Job)
-        .filter(Job.status == JobStatus.pending, Job.updated_at < pending_cutoff)
+        .filter(Job.status == JobStatus.pending, is_stale, is_due_to_run)
         .all()
     )
     for job in stale_pending:
         log.warning("job %s pending but stale, re-enqueueing (orphan sweep)", job.id)
-        requeue(str(job.id))
+        requeue(str(job.id), job.priority)
 
 
 def scheduler_loop():
+    # When manually verifying the queue drains after a test run, check
+    # jobs:scheduled alongside jobs:ready/inflight/retry - a stuck delayed
+    # job accumulates there silently since nothing else surfaces it.
     while True:
         try:
             promote_due_retries()
+            promote_due_scheduled()
             db = SessionLocal()
             try:
                 reap_expired_leases(db)
@@ -198,6 +215,7 @@ def scheduler_loop():
 def main():
     Base.metadata.create_all(bind=engine)
     run_schema_migrations(engine)
+    migrate_legacy_ready_queue()
     log.info("worker starting, waiting for jobs on the queue")
     threading.Thread(target=scheduler_loop, daemon=True).start()
     while True:

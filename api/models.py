@@ -26,6 +26,8 @@ class Job(Base):
     status = Column(Enum(JobStatus), nullable=False, default=JobStatus.pending)
     attempts = Column(Integer, nullable=False, default=0)
     result = Column(JSON, nullable=True)
+    run_at = Column(DateTime, nullable=True)
+    priority = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
