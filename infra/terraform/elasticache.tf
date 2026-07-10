@@ -45,6 +45,10 @@ resource "aws_secretsmanager_secret" "redis_url" {
 }
 
 resource "aws_secretsmanager_secret_version" "redis_url" {
-  secret_id     = aws_secretsmanager_secret.redis_url.id
-  secret_string = "rediss://:${random_password.redis_auth_token.result}@${aws_elasticache_replication_group.main.primary_endpoint_address}:${aws_elasticache_replication_group.main.port}/0"
+  secret_id = aws_secretsmanager_secret.redis_url.id
+  # urlencode() the token - override_special above includes URL metacharacters
+  # ('[', ']', ':', etc.) that break url parsing (or get misread as an IPv6
+  # literal) if embedded raw between "rediss://:" and "@". redis-py decodes
+  # the password back out of the URL on the other end.
+  secret_string = "rediss://:${urlencode(random_password.redis_auth_token.result)}@${aws_elasticache_replication_group.main.primary_endpoint_address}:${aws_elasticache_replication_group.main.port}/0"
 }
