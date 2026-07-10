@@ -113,3 +113,32 @@ def _pop_due(key):
         if redis_client.zrem(key, member):
             popped.append(member)
     return popped
+
+
+# Webhook delivery queue: a plain list (not a priority sorted set like
+# READY_KEY) since delivery order across different jobs' webhooks doesn't
+# matter the way job dispatch order does.
+WEBHOOK_READY_KEY = "webhooks:ready"
+WEBHOOK_RETRY_KEY = "webhooks:retry"
+BLPOP_TIMEOUT_SECONDS = 5
+
+
+def enqueue_webhook_delivery(delivery_id):
+    redis_client.rpush(WEBHOOK_READY_KEY, str(delivery_id))
+
+
+def dequeue_webhook_delivery():
+    result = redis_client.blpop(WEBHOOK_READY_KEY, timeout=BLPOP_TIMEOUT_SECONDS)
+    if result is None:
+        return None
+    _, delivery_id = result
+    return delivery_id
+
+
+def schedule_webhook_retry(delivery_id, delay_seconds):
+    redis_client.zadd(WEBHOOK_RETRY_KEY, {str(delivery_id): time.time() + delay_seconds})
+
+
+def promote_due_webhook_retries():
+    for delivery_id in _pop_due(WEBHOOK_RETRY_KEY):
+        redis_client.rpush(WEBHOOK_READY_KEY, delivery_id)

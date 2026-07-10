@@ -31,6 +31,7 @@ with engine.connect() as _conn:
     _conn.execute(text("ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'dead_letter'"))
     _conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS run_at TIMESTAMP"))
     _conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 0"))
+    _conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS webhook_url VARCHAR"))
     _conn.commit()
 
 app = FastAPI(title="Task Scheduler")
@@ -80,7 +81,12 @@ def metrics(db: Session = Depends(get_db)):
 
 @app.post("/jobs", response_model=schemas.JobResponse, status_code=201)
 def create_job(body: schemas.JobCreate, db: Session = Depends(get_db)):
-    job = models.Job(payload=body.payload, run_at=body.run_at, priority=body.priority)
+    job = models.Job(
+        payload=body.payload,
+        run_at=body.run_at,
+        priority=body.priority,
+        webhook_url=body.webhook_url,
+    )
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -97,13 +103,32 @@ def create_job(body: schemas.JobCreate, db: Session = Depends(get_db)):
     return job
 
 
-@app.get("/jobs/{job_id}", response_model=schemas.JobResponse)
-def get_job(job_id: str, db: Session = Depends(get_db)):
+def _parse_job_id(job_id: str) -> uuid.UUID:
     try:
-        job_uuid = uuid.UUID(job_id)
+        return uuid.UUID(job_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Job not found")
+
+
+def _get_job_or_404(db: Session, job_id: str) -> models.Job:
+    job_uuid = _parse_job_id(job_id)
     job = db.query(models.Job).filter(models.Job.id == job_uuid).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.get("/jobs/{job_id}", response_model=schemas.JobResponse)
+def get_job(job_id: str, db: Session = Depends(get_db)):
+    return _get_job_or_404(db, job_id)
+
+
+@app.get("/jobs/{job_id}/webhooks", response_model=list[schemas.WebhookDeliveryResponse])
+def get_webhook_deliveries(job_id: str, db: Session = Depends(get_db)):
+    job = _get_job_or_404(db, job_id)
+    return (
+        db.query(models.WebhookDelivery)
+        .filter(models.WebhookDelivery.job_id == job.id)
+        .order_by(models.WebhookDelivery.created_at)
+        .all()
+    )

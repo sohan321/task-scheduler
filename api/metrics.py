@@ -13,6 +13,11 @@ from models import Job, JobStatus
 INFLIGHT_KEY = "jobs:inflight"
 # RETRY_KEY must match worker/job_queue.py's RETRY_KEY exactly.
 RETRY_KEY = "jobs:retry"
+# WEBHOOK_READY_KEY must match worker/job_queue.py's WEBHOOK_READY_KEY
+# exactly - it's a plain list (LLEN, not ZCARD).
+WEBHOOK_READY_KEY = "webhooks:ready"
+# WEBHOOK_RETRY_KEY must match worker/job_queue.py's WEBHOOK_RETRY_KEY exactly.
+WEBHOOK_RETRY_KEY = "webhooks:retry"
 
 HTTP_REQUESTS_TOTAL = Counter(
     "http_requests_total", "Total HTTP requests", ["method", "path", "status"]
@@ -30,9 +35,20 @@ def render_metrics(db: Session) -> bytes:
     for status in JobStatus:
         JOBS_BY_STATUS.labels(status=status.value).set(counts.get(status, 0))
 
-    QUEUE_DEPTH.labels(queue="ready").set(redis_client.zcard(READY_KEY))
-    QUEUE_DEPTH.labels(queue="scheduled").set(redis_client.zcard(SCHEDULED_KEY))
-    QUEUE_DEPTH.labels(queue="inflight").set(redis_client.zcard(INFLIGHT_KEY))
-    QUEUE_DEPTH.labels(queue="retry").set(redis_client.zcard(RETRY_KEY))
+    pipe = redis_client.pipeline()
+    pipe.zcard(READY_KEY)
+    pipe.zcard(SCHEDULED_KEY)
+    pipe.zcard(INFLIGHT_KEY)
+    pipe.zcard(RETRY_KEY)
+    pipe.llen(WEBHOOK_READY_KEY)
+    pipe.zcard(WEBHOOK_RETRY_KEY)
+    ready, scheduled, inflight, retry, webhooks_ready, webhooks_retry = pipe.execute()
+
+    QUEUE_DEPTH.labels(queue="ready").set(ready)
+    QUEUE_DEPTH.labels(queue="scheduled").set(scheduled)
+    QUEUE_DEPTH.labels(queue="inflight").set(inflight)
+    QUEUE_DEPTH.labels(queue="retry").set(retry)
+    QUEUE_DEPTH.labels(queue="webhooks_ready").set(webhooks_ready)
+    QUEUE_DEPTH.labels(queue="webhooks_retry").set(webhooks_retry)
 
     return generate_latest()
