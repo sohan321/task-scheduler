@@ -5,6 +5,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+from prometheus_client import start_http_server
 from sqlalchemy import text
 
 from database import SessionLocal, Base, engine
@@ -20,6 +21,15 @@ from job_queue import (
     requeue,
     schedule_retry,
 )
+from logging_config import configure_logging
+from metrics import (
+    DEAD_LETTERS_TOTAL,
+    JOB_DURATION_SECONDS,
+    JOBS_PROCESSED_TOTAL,
+    LEASES_EXPIRED_TOTAL,
+    ORPHANS_RECLAIMED_TOTAL,
+    RETRIES_SCHEDULED_TOTAL,
+)
 from models import DeadLetterJob, Job, JobStatus
 
 MIN_WORK_SECONDS = float(os.environ.get("MIN_WORK_SECONDS", "1"))
@@ -33,8 +43,9 @@ SCHEDULER_INTERVAL_SECONDS = float(os.environ.get("SCHEDULER_INTERVAL_SECONDS", 
 PENDING_ORPHAN_GRACE_SECONDS = float(
     os.environ.get("PENDING_ORPHAN_GRACE_SECONDS", str(MAX_BACKOFF_SECONDS + 60))
 )
+METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s worker %(message)s")
+configure_logging()
 log = logging.getLogger("worker")
 
 
@@ -92,7 +103,12 @@ def dead_letter(db, job, error):
         )
     )
     db.commit()
-    log.error("job %s dead-lettered after %s attempts: %s", job.id, job.attempts, error)
+    DEAD_LETTERS_TOTAL.inc()
+    JOBS_PROCESSED_TOTAL.labels(outcome="dead_letter").inc()
+    log.error(
+        "job dead-lettered",
+        extra={"job_id": str(job.id), "attempts": job.attempts, "error": error},
+    )
 
 
 def fail_attempt(db, job, error):
@@ -104,9 +120,17 @@ def fail_attempt(db, job, error):
     job.result = {"error": error}
     db.commit()
     schedule_retry(str(job.id), job.priority, delay)
+    RETRIES_SCHEDULED_TOTAL.inc()
+    JOBS_PROCESSED_TOTAL.labels(outcome="retry").inc()
     log.warning(
-        "job %s failed (attempt %s/%s), retrying in %.1fs: %s",
-        job.id, job.attempts, MAX_ATTEMPTS, delay, error,
+        "job failed, retrying",
+        extra={
+            "job_id": str(job.id),
+            "attempt": job.attempts,
+            "max_attempts": MAX_ATTEMPTS,
+            "retry_delay_seconds": round(delay, 1),
+            "error": error,
+        },
     )
 
 
@@ -117,22 +141,28 @@ def _heartbeat_loop(job_id, attempt, stop_event):
 
 
 def process_job(db, job):
-    log.info("processing job %s (attempt %s)", job.id, job.attempts)
+    log.info("processing job", extra={"job_id": str(job.id), "attempt": job.attempts})
     stop_heartbeat = threading.Event()
     heartbeat = threading.Thread(
         target=_heartbeat_loop, args=(str(job.id), job.attempts, stop_heartbeat), daemon=True
     )
     heartbeat.start()
+    start = time.perf_counter()
     try:
         mark_inflight(str(job.id), job.attempts, LEASE_SECONDS)
         result = simulate_work()
         job.status = JobStatus.success
         job.result = result
         db.commit()
-        log.info("job %s succeeded", job.id)
+        JOBS_PROCESSED_TOTAL.labels(outcome="success").inc()
+        log.info(
+            "job succeeded",
+            extra={"job_id": str(job.id), "attempt": job.attempts, "duration_seconds": result["duration_seconds"]},
+        )
     except Exception as exc:
         fail_attempt(db, job, str(exc))
     finally:
+        JOB_DURATION_SECONDS.observe(time.perf_counter() - start)
         stop_heartbeat.set()
         heartbeat.join(timeout=1)
         clear_inflight(str(job.id), job.attempts)
@@ -149,7 +179,8 @@ def reap_expired_leases(db):
         if not job:
             # already finished, or superseded by a newer attempt
             continue
-        log.warning("job %s lease expired (attempt %s)", job.id, job.attempts)
+        LEASES_EXPIRED_TOTAL.inc()
+        log.warning("job lease expired", extra={"job_id": str(job.id), "attempt": job.attempts})
         fail_attempt(db, job, "lease expired: worker crashed or exceeded visibility timeout")
 
 
@@ -170,7 +201,8 @@ def sweep_stale_jobs(db):
             # under normal lease management: fresh, heartbeat-renewed, or
             # about to be picked up by reap_expired_leases
             continue
-        log.warning("job %s running with no lease entry, reclaiming (orphan sweep)", job.id)
+        ORPHANS_RECLAIMED_TOTAL.inc()
+        log.warning("job orphaned (running, no lease), reclaiming", extra={"job_id": str(job.id)})
         fail_attempt(db, job, "running with no active lease (orphan sweep)")
 
     now = datetime.utcnow()
@@ -189,7 +221,14 @@ def sweep_stale_jobs(db):
         .all()
     )
     for job in stale_pending:
-        log.warning("job %s pending but stale, re-enqueueing (orphan sweep)", job.id)
+        ORPHANS_RECLAIMED_TOTAL.inc()
+        log.warning("job orphaned (pending, stale), re-enqueueing", extra={"job_id": str(job.id)})
+        # requeue() only touches Redis - without bumping updated_at here too,
+        # this job keeps matching is_stale on every future tick until a
+        # worker claims it, re-firing the counter and re-enqueueing it once
+        # per second for as long as the queue is backed up.
+        job.updated_at = datetime.utcnow()
+        db.commit()
         requeue(str(job.id), job.priority)
 
 
@@ -216,7 +255,8 @@ def main():
     Base.metadata.create_all(bind=engine)
     run_schema_migrations(engine)
     migrate_legacy_ready_queue()
-    log.info("worker starting, waiting for jobs on the queue")
+    start_http_server(METRICS_PORT)
+    log.info("worker starting, waiting for jobs on the queue", extra={"metrics_port": METRICS_PORT})
     threading.Thread(target=scheduler_loop, daemon=True).start()
     while True:
         job_id = dequeue_job()
@@ -228,9 +268,9 @@ def main():
             if job:
                 process_job(db, job)
             else:
-                log.warning("job %s not found or already claimed", job_id)
+                log.warning("job not found or already claimed", extra={"job_id": job_id})
         except Exception:
-            log.exception("unhandled error processing job %s", job_id)
+            log.exception("unhandled error processing job", extra={"job_id": job_id})
         finally:
             db.close()
 

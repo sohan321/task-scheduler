@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars and adjust as needed. terraform.tfvars is
+# gitignored - don't commit it if you put real image tags/account-specific
+# values in it.
+
+aws_region   = "us-east-1"
+project_name = "task-scheduler"
+environment  = "dev"
+
+# Leave these blank for the first `terraform apply` (creates the ECR repos
+# and everything else); fill them in with the pushed image URIs from the
+# ecr_api_repository_url / ecr_worker_repository_url outputs, then re-apply
+# to roll the ECS services onto real images.
+# api_image    = "123456789012.dkr.ecr.us-east-1.amazonaws.com/task-scheduler-api:latest"
+# worker_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/task-scheduler-worker:latest"

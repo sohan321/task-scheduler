@@ -43,11 +43,17 @@ services:
   # Single replica by default. The worker holds no in-process concurrency -
   # run multiple concurrent workers via `docker compose up --scale worker=N`;
   # claim_job's Postgres row lock makes that safe against double-processing.
+  # No fixed host port for metrics - a fixed mapping would conflict across
+  # replicas when scaled. Compose assigns each replica its own random host
+  # port instead; find it with `docker compose port worker 9100`.
   worker:
     build: ./worker
+    ports:
+      - "9100"
     environment:
       DATABASE_URL: postgresql://scheduler:scheduler@postgres:5432/scheduler
       REDIS_URL: redis://redis:6379/0
+      METRICS_PORT: "9100"
     depends_on:
       postgres:
         condition: service_healthy

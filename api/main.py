@@ -1,7 +1,10 @@
+import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -9,6 +12,16 @@ import models
 import schemas
 from database import engine, get_db
 from job_queue import enqueue_job, schedule_job
+from logging_config import configure_logging
+from metrics import (
+    HTTP_REQUEST_DURATION_SECONDS,
+    HTTP_REQUESTS_TOTAL,
+    JOBS_CREATED_TOTAL,
+    render_metrics,
+)
+
+configure_logging()
+log = logging.getLogger("api")
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -21,6 +34,48 @@ with engine.connect() as _conn:
     _conn.commit()
 
 app = FastAPI(title="Task Scheduler")
+
+
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        duration = time.perf_counter() - start
+        # Prefer the matched route template ("/jobs/{job_id}") over the raw
+        # path so per-job UUIDs (or, on a 404, arbitrary scanner-supplied
+        # paths from the public ALB) don't blow up label cardinality.
+        route = request.scope.get("route")
+        path = route.path if route else "unmatched"
+        HTTP_REQUESTS_TOTAL.labels(request.method, path, status_code).inc()
+        HTTP_REQUEST_DURATION_SECONDS.labels(request.method, path).observe(duration)
+        log.info(
+            "http request",
+            extra={
+                "http_method": request.method,
+                "http_path": path,
+                "http_status": status_code,
+                "duration_ms": round(duration * 1000, 2),
+            },
+        )
+
+
+@app.get("/healthz")
+def healthz():
+    # Deliberately independent of Postgres/Redis - this is what the ALB
+    # target group health-checks, so a DB/Redis blip shouldn't look like a
+    # dead task and trigger ECS to cycle it. Use /metrics for a check that
+    # exercises dependencies.
+    return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics(db: Session = Depends(get_db)):
+    return Response(content=render_metrics(db), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/jobs", response_model=schemas.JobResponse, status_code=201)
@@ -37,6 +92,8 @@ def create_job(body: schemas.JobCreate, db: Session = Depends(get_db)):
         schedule_job(job.id, job.priority, run_at_epoch)
     else:
         enqueue_job(job.id, job.priority)
+    JOBS_CREATED_TOTAL.inc()
+    log.info("job created", extra={"job_id": str(job.id), "priority": job.priority, "run_at": job.run_at})
     return job
 
 
