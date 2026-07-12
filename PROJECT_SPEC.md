@@ -10,6 +10,11 @@ A worker script that polls for pending jobs, simulates work (sleep + random fail
 docker-compose.yml running API + Postgres
 
 Phase 2 — Real queueing: replace polling with Redis (BLPOP), support multiple concurrent workers with no double-processing.
+Phase 2.5 — One real task type (image resize):
+Job payload for this type: {"type": "resize_image", "image_url": "...", "target_size": [200, 200]}
+Worker downloads the image, resizes it with Pillow, saves the output (locally to a mounted volume for now; S3 once on AWS in Phase 5)
+Job's "result" field stores the output path/URL once complete
+This is the task type used for the live demo (submit -> watch it process -> see the actual resized image)
 Phase 3 — Reliability: exponential backoff retries with jitter, visibility timeout/lease so crashed workers don't lose jobs, dead-letter table after N failed attempts.
 Phase 4 — Scheduling & priority: delayed jobs (run_at), priority queues via Redis sorted sets.
 Phase 5 — Observability & AWS deploy: structured logging, a /metrics endpoint, deploy to AWS (ECS Fargate + RDS + ElastiCache).

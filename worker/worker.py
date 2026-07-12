@@ -1,11 +1,17 @@
+import io
+import ipaddress
 import logging
 import os
 import random
+import socket
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta
+from urllib.parse import urljoin, urlparse
 
 import requests
+from PIL import Image
 from prometheus_client import start_http_server
 from sqlalchemy import text
 
@@ -39,7 +45,7 @@ from metrics import (
     WEBHOOK_RETRIES_SCHEDULED_TOTAL,
     WEBHOOKS_DELIVERED_TOTAL,
 )
-from models import DeadLetterJob, Job, JobStatus, WebhookDelivery, WebhookStatus
+from models import DeadLetterJob, Job, JobStatus, RESIZE_IMAGE_TYPE, WebhookDelivery, WebhookStatus
 
 MIN_WORK_SECONDS = float(os.environ.get("MIN_WORK_SECONDS", "1"))
 MAX_WORK_SECONDS = float(os.environ.get("MAX_WORK_SECONDS", "4"))
@@ -60,6 +66,15 @@ WEBHOOK_MAX_BACKOFF_SECONDS = float(os.environ.get("WEBHOOK_MAX_BACKOFF_SECONDS"
 WEBHOOK_ORPHAN_GRACE_SECONDS = float(
     os.environ.get("WEBHOOK_ORPHAN_GRACE_SECONDS", str(WEBHOOK_MAX_BACKOFF_SECONDS + 60))
 )
+IMAGE_OUTPUT_DIR = os.environ.get("IMAGE_OUTPUT_DIR", "/data/images")
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = float(os.environ.get("IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "15"))
+MAX_IMAGE_DOWNLOAD_BYTES = int(os.environ.get("MAX_IMAGE_DOWNLOAD_BYTES", str(20 * 1024 * 1024)))
+MAX_IMAGE_REDIRECTS = int(os.environ.get("MAX_IMAGE_REDIRECTS", "3"))
+# Pillow's own decompression-bomb guard (Image.MAX_IMAGE_PIXELS) only raises
+# above 2x its default threshold and merely warns below that, so a well-
+# compressed image can still decode to a large allocation; this is an
+# explicit, deterministic cap checked before any pixel data is decoded.
+MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", str(40_000_000)))
 
 configure_logging()
 log = logging.getLogger("worker")
@@ -101,6 +116,93 @@ def simulate_work():
     if random.random() < FAILURE_RATE:
         raise RuntimeError("simulated failure")
     return {"message": "job completed", "duration_seconds": round(duration, 2)}
+
+
+def _is_blocked_address(ip_str):
+    # Duplicated from api/schemas.py's identical check, following this repo's
+    # existing convention (models.py, logging_config.py) of hand-syncing
+    # small shared pieces across the api/worker Docker build contexts.
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _ensure_public_host(hostname):
+    try:
+        resolved = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"could not resolve host {hostname!r}") from exc
+    if any(_is_blocked_address(info[4][0]) for info in resolved):
+        raise ValueError(f"{hostname!r} resolves to a blocked local/internal address")
+
+
+def _fetch_image_bytes(image_url):
+    # api/schemas.py validates image_url isn't internal at job-creation time,
+    # but requests.get() follows redirects by default (even with
+    # stream=True) - a public decoy URL could 302 to an internal address
+    # (e.g. 169.254.169.254) at fetch time, bypassing that check entirely.
+    # Following redirects manually and re-validating each hop closes that gap.
+    url = image_url
+    for _ in range(MAX_IMAGE_REDIRECTS + 1):
+        _ensure_public_host(urlparse(url).hostname)
+        with requests.get(url, timeout=IMAGE_DOWNLOAD_TIMEOUT_SECONDS, stream=True, allow_redirects=False) as response:
+            if response.is_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("image_url redirected with no Location header")
+                url = urljoin(url, location)
+                continue
+            response.raise_for_status()
+            # Stream + cap the download: an unbounded read here is a DoS
+            # surface on its own, independent of the SSRF check above.
+            chunks = []
+            total_bytes = 0
+            for chunk in response.iter_content(chunk_size=65536):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_IMAGE_DOWNLOAD_BYTES:
+                    raise ValueError(f"image exceeds max download size of {MAX_IMAGE_DOWNLOAD_BYTES} bytes")
+                chunks.append(chunk)
+            return b"".join(chunks)
+    raise ValueError(f"too many redirects (max {MAX_IMAGE_REDIRECTS})")
+
+
+def resize_image_task(payload):
+    target_size = payload["target_size"]
+    image = Image.open(io.BytesIO(_fetch_image_bytes(payload["image_url"])))
+    if image.width * image.height > MAX_IMAGE_PIXELS:
+        raise ValueError(f"image has too many pixels ({image.width}x{image.height}), max is {MAX_IMAGE_PIXELS}")
+    image.load()  # force full decode now, while the buffer above is still alive
+    if image.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+        # RGBA (not RGB) so any alpha channel on an otherwise-unrecognized
+        # mode is preserved rather than silently flattened to opaque.
+        image = image.convert("RGBA")
+    resized = image.resize(target_size, Image.LANCZOS)
+    filename = f"{uuid.uuid4()}.png"
+    os.makedirs(IMAGE_OUTPUT_DIR, exist_ok=True)
+    # Always re-encode as PNG regardless of input format - simplest way to
+    # guarantee a decodable, lossless output without per-format branching.
+    resized.save(os.path.join(IMAGE_OUTPUT_DIR, filename), format="PNG")
+    return {
+        "filename": filename,
+        "width": target_size[0],
+        "height": target_size[1],
+        "content_type": "image/png",
+    }
+
+
+def run_job(payload):
+    if isinstance(payload, dict) and payload.get("type") == RESIZE_IMAGE_TYPE:
+        return resize_image_task(payload)
+    return simulate_work()
 
 
 def compute_backoff(attempt, base_seconds, max_seconds):
@@ -303,7 +405,7 @@ def process_job(db, job):
     succeeded = False
     try:
         mark_inflight(str(job.id), job.attempts, LEASE_SECONDS)
-        result = simulate_work()
+        result = run_job(job.payload)
         job.status = JobStatus.success
         job.result = result
         db.commit()
@@ -311,7 +413,11 @@ def process_job(db, job):
         JOBS_PROCESSED_TOTAL.labels(outcome="success").inc()
         log.info(
             "job succeeded",
-            extra={"job_id": str(job.id), "attempt": job.attempts, "duration_seconds": result["duration_seconds"]},
+            extra={
+                "job_id": str(job.id),
+                "attempt": job.attempts,
+                "duration_seconds": round(time.perf_counter() - start, 2),
+            },
         )
     except Exception as exc:
         fail_attempt(db, job, str(exc))

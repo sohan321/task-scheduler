@@ -34,6 +34,13 @@ services:
     environment:
       DATABASE_URL: postgresql://scheduler:scheduler@postgres:5432/scheduler
       REDIS_URL: redis://redis:6379/0
+      IMAGE_OUTPUT_DIR: /data/images
+    volumes:
+      # Shared with worker: worker writes resized images here, api reads them
+      # back for GET /jobs/{id}/output. Host bind mount (not a named volume)
+      # so the resized files are also directly browsable from the host during
+      # local dev/demo.
+      - ./data/images:/data/images
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,6 +61,9 @@ services:
       DATABASE_URL: postgresql://scheduler:scheduler@postgres:5432/scheduler
       REDIS_URL: redis://redis:6379/0
       METRICS_PORT: "9100"
+      IMAGE_OUTPUT_DIR: /data/images
+    volumes:
+      - ./data/images:/data/images
     depends_on:
       postgres:
         condition: service_healthy

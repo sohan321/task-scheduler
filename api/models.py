@@ -9,6 +9,8 @@ from sqlalchemy.dialects.postgresql import UUID
 
 from database import Base
 
+RESIZE_IMAGE_TYPE = "resize_image"
+
 
 class JobStatus(str, enum.Enum):
     pending = "pending"

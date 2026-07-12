@@ -1,9 +1,11 @@
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse
 from prometheus_client import CONTENT_TYPE_LATEST
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -22,6 +24,8 @@ from metrics import (
 
 configure_logging()
 log = logging.getLogger("api")
+
+IMAGE_OUTPUT_DIR = os.environ.get("IMAGE_OUTPUT_DIR", "/data/images")
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -121,6 +125,21 @@ def _get_job_or_404(db: Session, job_id: str) -> models.Job:
 @app.get("/jobs/{job_id}", response_model=schemas.JobResponse)
 def get_job(job_id: str, db: Session = Depends(get_db)):
     return _get_job_or_404(db, job_id)
+
+
+@app.get("/jobs/{job_id}/output")
+def get_job_output(job_id: str, db: Session = Depends(get_db)):
+    job = _get_job_or_404(db, job_id)
+    if job.payload.get("type") != models.RESIZE_IMAGE_TYPE:
+        raise HTTPException(status_code=404, detail="This job does not produce a downloadable output")
+    if job.status != models.JobStatus.success or not isinstance(job.result, dict) or "filename" not in job.result:
+        raise HTTPException(status_code=404, detail="No output file available for this job")
+    # filename is worker-generated (uuid4 + ".png"), never taken from request
+    # input, so there's no path-traversal surface in joining it here.
+    path = os.path.join(IMAGE_OUTPUT_DIR, job.result["filename"])
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Output file not found")
+    return FileResponse(path, media_type=job.result.get("content_type", "application/octet-stream"))
 
 
 @app.get("/jobs/{job_id}/webhooks", response_model=list[schemas.WebhookDeliveryResponse])
